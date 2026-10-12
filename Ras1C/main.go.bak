@@ -1,0 +1,203 @@
+// ras1c — читает список инфобаз и активных сессий кластера 1С:Предприятие
+// через сервис RAS (Remote Administration Server), по умолчанию порт 1545.
+//
+// Использует чистую Go-реализацию протокола RAS (github.com/khorevaa/ras-client),
+// поэтому НЕ требует установленной платформы 1С или утилиты rac на машине.
+//
+//   ras1c -host 10.0.0.5
+//   ras1c -host 10.0.0.5 -user Администратор -password 'secret' -json
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "flag"
+    "fmt"
+    "os"
+    "text/tabwriter"
+    "time"
+
+    rclient "github.com/khorevaa/ras-client"
+    "github.com/khorevaa/ras-client/serialize"
+    uuid "github.com/satori/go.uuid"
+)
+
+func main() {
+    var (
+        host     = flag.String("host", "", "IP-адрес или имя сервера RAS (обязательно)")
+        port     = flag.Int("port", 1545, "порт RAS")
+        user     = flag.String("user", "", "администратор кластера (если задано администрирование)")
+        password = flag.String("password", "", "пароль администратора кластера")
+        showIB   = flag.Bool("infobases", true, "выводить список информационных баз")
+        showSess = flag.Bool("sessions", true, "выводить список сессий")
+        asJSON   = flag.Bool("json", false, "вывод в формате JSON")
+        timeout  = flag.Duration("timeout", 30*time.Second, "таймаут операции")
+    )
+    flag.Parse()
+
+    if *host == "" {
+        fmt.Fprintln(os.Stderr, "ошибка: не задан -host")
+        flag.Usage()
+        os.Exit(2)
+    }
+
+    addr := fmt.Sprintf("%s:%d", *host, *port)
+    ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+    defer cancel()
+
+    client := rclient.NewClient(addr)
+    defer client.Close()
+
+    clusters, err := client.GetClusters(ctx)
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "не удалось получить кластеры с %s: %v\n", addr, err)
+        os.Exit(1)
+    }
+
+    report := Report{Server: addr, RetrievedAt: time.Now()}
+
+    for _, cl := range clusters {
+        // Учётные данные сохраняются в клиенте и применяются к последующим
+        // запросам этого кластера. Нужны, если для кластера включено
+        // администрирование; иначе флаги можно не задавать.
+        if *user != "" {
+            client.AuthenticateCluster(cl.UUID, *user, *password)
+        }
+
+        cr := ClusterReport{
+            UUID: cl.UUID.String(),
+            Name: cl.Name,
+            Host: cl.Host,
+            Port: int(cl.Port),
+        }
+
+        var ibByID map[uuid.UUID]string
+
+        if *showIB {
+            ibs, err := client.GetClusterInfobases(ctx, cl.UUID)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "кластер %s: не удалось получить инфобазы: %v\n", cl.Name, err)
+            } else {
+                ibByID = make(map[uuid.UUID]string, len(ibs))
+                for _, ib := range ibs {
+                    ibByID[ib.UUID] = ib.Name
+                    cr.Infobases = append(cr.Infobases, InfobaseReport{
+                        UUID:        ib.UUID.String(),
+                        Name:        ib.Name,
+                        Description: ib.Description,
+                    })
+                }
+            }
+        }
+
+        if *showSess {
+            sessions, err := client.GetClusterSessions(ctx, cl.UUID)
+            if err != nil {
+                fmt.Fprintf(os.Stderr, "кластер %s: не удалось получить сессии: %v\n", cl.Name, err)
+            } else {
+                for _, s := range sessions {
+                    cr.Sessions = append(cr.Sessions, sessionReport(s, ibByID))
+                }
+            }
+        }
+
+        report.Clusters = append(report.Clusters, cr)
+    }
+
+    if *asJSON {
+        enc := json.NewEncoder(os.Stdout)
+        enc.SetIndent("", "  ")
+        if err := enc.Encode(report); err != nil {
+            fmt.Fprintf(os.Stderr, "ошибка кодирования JSON: %v\n", err)
+            os.Exit(1)
+        }
+        return
+    }
+
+    printReport(report)
+}
+
+func sessionReport(s *serialize.SessionInfo, ibByID map[uuid.UUID]string) SessionReport {
+    return SessionReport{
+        ID:           s.ID,
+        UUID:         s.UUID.String(),
+        Infobase:     ibByID[s.InfobaseID],
+        InfobaseID:   s.InfobaseID.String(),
+        User:         s.UserName,
+        Host:         s.Host,
+        App:          s.AppId,
+        ClientIP:     s.ClientIPAddress,
+        StartedAt:    s.StartedAt,
+        LastActiveAt: s.LastActiveAt,
+    }
+}
+
+// --- модель отчёта ---
+
+type Report struct {
+    Server      string          `json:"server"`
+    RetrievedAt time.Time       `json:"retrieved_at"`
+    Clusters    []ClusterReport `json:"clusters"`
+}
+
+type ClusterReport struct {
+    UUID      string           `json:"uuid"`
+    Name      string           `json:"name"`
+    Host      string           `json:"host"`
+    Port      int              `json:"port"`
+    Infobases []InfobaseReport `json:"infobases,omitempty"`
+    Sessions  []SessionReport  `json:"sessions,omitempty"`
+}
+
+type InfobaseReport struct {
+    UUID        string `json:"uuid"`
+    Name        string `json:"name"`
+    Description string `json:"description,omitempty"`
+}
+
+type SessionReport struct {
+    ID           int       `json:"id"`
+    UUID         string    `json:"uuid"`
+    Infobase     string    `json:"infobase,omitempty"`
+    InfobaseID   string    `json:"infobase_id"`
+    User         string    `json:"user"`
+    Host         string    `json:"host"`
+    App          string    `json:"app"`
+    ClientIP     string    `json:"client_ip"`
+    StartedAt    time.Time `json:"started_at"`
+    LastActiveAt time.Time `json:"last_active_at"`
+}
+
+func printReport(r Report) {
+    fmt.Printf("RAS %s  —  %s\n", r.Server, r.RetrievedAt.Format("2006-01-02 15:04:05"))
+    for _, cl := range r.Clusters {
+        fmt.Printf("\n=== Кластер: %s (%s)  %s:%d ===\n", cl.Name, cl.UUID, cl.Host, cl.Port)
+
+        if len(cl.Infobases) > 0 {
+            fmt.Printf("\nИнформационные базы (%d):\n", len(cl.Infobases))
+            w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+            fmt.Fprintln(w, "  ИМЯ\tОПИСАНИЕ\tUUID")
+            for _, ib := range cl.Infobases {
+                fmt.Fprintf(w, "  %s\t%s\t%s\n", ib.Name, ib.Description, ib.UUID)
+            }
+            w.Flush()
+        }
+
+        if len(cl.Sessions) > 0 {
+            fmt.Printf("\nСессии (%d):\n", len(cl.Sessions))
+            w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+            fmt.Fprintln(w, "  ID\tПОЛЬЗОВАТЕЛЬ\tИНФОБАЗА\tПРИЛОЖЕНИЕ\tХОСТ\tIP\tНАЧАЛО\tАКТИВНОСТЬ")
+            for _, s := range cl.Sessions {
+                fmt.Fprintf(w, "  %d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                    s.ID, s.User, s.Infobase, s.App, s.Host, s.ClientIP,
+                    s.StartedAt.Format("15:04:05"), s.LastActiveAt.Format("15:04:05"))
+            }
+            w.Flush()
+        }
+
+        if len(cl.Infobases) == 0 && len(cl.Sessions) == 0 {
+            fmt.Println("  (нет данных — возможно, требуется -user/-password администратора кластера)")
+        }
+    }
+}
+
