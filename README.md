@@ -25,8 +25,8 @@
 
 1C Toollkit
 ---
-- Ras1c - работа с административными функциями 1С - [Инструкция по 1CBruteWEB](./1С_Brute_pass_Web/README.md)
-- 1C-Web-Brute - брутфорс и проверка на нулевые пароли через WEB [Инструкция по Ras1C](./Ras1C/README.md)
+- Ras1c - работа с административными функциями 1С - [Инструкция по Ras1C](./Ras1C/README.md)
+- 1C-Web-Brute - брутфорс и проверка на нулевые пароли через WEB [Инструкция по 1CBruteWEB](./1С_Brute_pass_Web/README.md)
 
 Futures:
 ---
